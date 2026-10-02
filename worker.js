@@ -24,6 +24,25 @@
     let sampleRate = 0;
     const guard = PcmCore.createEndpointGuard();
 
+    /** 输出采样率：第 1 路（基准轨）的采样率 */
+    function outputRate() {
+      return sampleRate || (tracks[0] && tracks[0].sampleRate) || 0;
+    }
+
+    /**
+     * 重采样到输出采样率后取分析窗口（开头至多 WINDOW 个输出采样）。
+     * 只需重采样覆盖 WINDOW 个输出采样的源前缀。
+     */
+    function resampledWindow(track, outRate) {
+      const rate = track.sampleRate || outRate;
+      const srcLen = Math.min(
+        track.samples.length,
+        Math.ceil((PcmCore.WINDOW * rate) / outRate) + 2
+      );
+      const rs = PcmCore.resampleLinear(track.samples.subarray(0, srcLen), rate, outRate);
+      return rs.length > PcmCore.WINDOW ? rs.subarray(0, PcmCore.WINDOW) : rs;
+    }
+
     async function handle(msg) {
       if (msg.type === 'load') {
         const token = guard.begin(msg.gen);
@@ -36,11 +55,15 @@
 
       if (msg.type === 'analyze') {
         const token = guard.begin(msg.gen);
-        const ref = tracks[0].samples.subarray(0, PcmCore.WINDOW);
+        if (tracks.length === 0) return { type: 'analyzed', gen: token.gen, delays: [] };
+        const outRate = outputRate();
+        // 统一重采样到输出采样率再搜索：采样率不同的音轨，同一时刻的
+        // 脉冲在原始样本域序号不同，直接相关会判成错位
+        const ref = resampledWindow(tracks[0], outRate);
         const delays = [0];
         // 每一路分块搜索，块间让出事件循环以响应取消
         for (let i = 1; i < tracks.length; i++) {
-          const other = tracks[i].samples.subarray(0, PcmCore.WINDOW);
+          const other = resampledWindow(tracks[i], outRate);
           let bestD = -PcmCore.MAX_DELAY;
           let bestScore = PcmCore.correlationAt(ref, other, bestD);
           for (let d = -PcmCore.MAX_DELAY + 1; d <= PcmCore.MAX_DELAY; d++) {
@@ -60,18 +83,37 @@
 
       if (msg.type === 'mix') {
         const token = guard.begin(msg.gen);
+        const outRate = msg.sampleRate || sampleRate;
+        // 裁剪按各自原始样本坐标；裁剪后重采样到输出采样率，
+        // 延时（输出样本）与混音均在输出采样域进行
         const sampleArrays = tracks.map(function (t, i) {
-          const trim = (msg.trims || [])[i] || { start: 0, end: t.samples.length };
-          return t.samples.subarray(trim.start, trim.end);
+          const req = (msg.trims || [])[i] || {};
+          const trim = PcmCore.clampTrim(
+            req.start == null ? 0 : req.start,
+            req.end == null ? t.samples.length : req.end,
+            t.samples.length
+          );
+          return PcmCore.resampleLinear(
+            t.samples.subarray(trim.start, trim.end),
+            t.sampleRate || outRate,
+            outRate
+          );
+        });
+        const delays = tracks.map(function (t, i) {
+          return PcmCore.clampDelay((msg.delays || [])[i]);
+        });
+        const gains = tracks.map(function (t, i) {
+          const g = (msg.gains || [])[i];
+          return g == null ? 1 : PcmCore.quantizeGain(g);
         });
         const mixed = await PcmCore.mixTracks(
           sampleArrays,
-          msg.delays.slice(),
-          msg.gains.slice(),
+          delays,
+          gains,
           token.signal
         );
         if (mixed === null) return null; // 已被新一代请求取消
-        const wav = PcmCore.encodeWav(mixed, msg.sampleRate || sampleRate);
+        const wav = PcmCore.encodeWav(mixed, outRate);
         return {
           type: 'mixed',
           gen: token.gen,

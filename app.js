@@ -75,6 +75,9 @@
 
   async function importTracks(files) {
     hideError();
+    // 立即换代：读取文件期间旧分析/旧合成即失效；
+    // 若期间用户又发起新导入，本批完成后自行作废（防止旧批后到覆盖新批）
+    const gen = session.begin();
     const parsed = [];
     let rate = 0;
     for (const file of files) {
@@ -88,9 +91,8 @@
       if (rate === 0) rate = wav.sampleRate;
       parsed.push({ name: file.name, samples: wav.samples, sampleRate: wav.sampleRate });
     }
+    if (!session.isCurrent(gen)) return; // 读取期间已有更新的导入：丢弃本批
 
-    // 新一批导入：换代取消旧分析/旧合成
-    const gen = session.begin();
     tracks = parsed;
     sampleRate = rate;
     autoDelays = tracks.map(function () { return 0; });
@@ -237,14 +239,18 @@
       if (i === 0) return 0;
       if (delayInputs[i].value === '') return autoDelays[i];
       const v = parseInt(delayInputs[i].value, 10);
-      return Number.isFinite(v) ? v : autoDelays[i];
+      // 手工覆写截断到 ±32 个输出采样（input 的 min/max 不阻止键入越界值）
+      return Number.isFinite(v) ? C.clampDelay(v) : autoDelays[i];
     });
     const gains = tracks.map(function (t, i) {
       // 四分之一整数倍量化（0.3 → 0.25）
       return C.quantizeGain(parseFloat(gainInputs[i].value));
     });
     const trims = tracks.map(function (t, i) {
-      return { start: Number(trimStartInputs[i].value), end: Number(trimEndInputs[i].value) };
+      // 裁剪坐标为各自原始音轨的样本序号；空输入 = 不裁剪
+      const s = trimStartInputs[i].value === '' ? 0 : Number(trimStartInputs[i].value);
+      const e = trimEndInputs[i].value === '' ? t.samples.length : Number(trimEndInputs[i].value);
+      return C.clampTrim(s, e, t.samples.length);
     });
     return { delays: delays, gains: gains, trims: trims };
   }
@@ -253,6 +259,8 @@
 
   function onParamsChanged() {
     if (tracks.length === 0) return;
+    // 立即换代：旧合成若在防抖窗口内完成，也不得替换当前试听/下载
+    session.begin();
     statusEl.textContent = '参数已修改，等待稳定后重新合成…';
     clearTimeout(mixTimer);
     mixTimer = setTimeout(runMix, 150);

@@ -88,6 +88,68 @@
     return q;
   }
 
+  /** 延时截断到 [-MAX_DELAY, +MAX_DELAY] 整数；非数值归零 */
+  function clampDelay(value) {
+    const d = Math.round(Number(value));
+    if (!Number.isFinite(d)) return 0;
+    return d < -MAX_DELAY ? -MAX_DELAY : d > MAX_DELAY ? MAX_DELAY : d;
+  }
+
+  /**
+   * 裁剪区间规范化（坐标为各自原始音轨的样本序号）。
+   * 负值/越界截断到 [0, length]；start > end 视为空区间 [start, start)；
+   * 非数值时 start 视为 0、end 视为 length（即不裁剪）。
+   */
+  function clampTrim(start, end, length) {
+    let s = Math.floor(Number(start));
+    let e = Math.floor(Number(end));
+    if (!Number.isFinite(s)) s = 0;
+    if (!Number.isFinite(e)) e = length;
+    if (s < 0) s = 0; else if (s > length) s = length;
+    if (e < 0) e = 0; else if (e > length) e = length;
+    if (e < s) e = s;
+    return { start: s, end: e };
+  }
+
+  /** 四舍五入（负数向远离零方向）并饱和截断到 PCM16 */
+  function roundSaturate(v) {
+    const r = v >= 0 ? Math.floor(v + 0.5) : Math.ceil(v - 0.5);
+    return r < -32768 ? -32768 : r > 32767 ? 32767 : r;
+  }
+
+  /**
+   * 线性插值重采样到目标采样率。
+   *
+   * 输出长度 = round(srcLen * dstRate / srcRate)，保持物理时长，
+   * 因此相同时长的音轨重采样到同一输出采样率后长度一致，
+   * 低采样率轨不会在输出时间轴上提前结束。
+   * 起点对齐：out[n] 对应源位置 n * srcRate / dstRate。
+   * 同采样率时返回拷贝（与输入解耦）。
+   */
+  function resampleLinear(samples, srcRate, dstRate) {
+    srcRate = Number(srcRate);
+    dstRate = Number(dstRate);
+    if (!Number.isFinite(srcRate) || !Number.isFinite(dstRate) ||
+        srcRate <= 0 || dstRate <= 0) {
+      throw new Error('非法采样率：' + srcRate + ' -> ' + dstRate);
+    }
+    const srcLen = samples.length;
+    if (srcLen === 0) return new Int16Array(0);
+    if (srcRate === dstRate) return Int16Array.from(samples);
+    const outLen = Math.max(1, Math.round(srcLen * dstRate / srcRate));
+    const out = new Int16Array(outLen);
+    const ratio = srcRate / dstRate;
+    for (let n = 0; n < outLen; n++) {
+      const pos = n * ratio;
+      const i = pos >= srcLen - 1 ? srcLen - 1 : Math.floor(pos);
+      const frac = pos - i;
+      const s0 = samples[i];
+      const s1 = i + 1 < srcLen ? samples[i + 1] : s0;
+      out[n] = roundSaturate(s0 + (s1 - s0) * frac);
+    }
+    return out;
+  }
+
   /**
    * 逐样本混音。
    *
@@ -125,8 +187,7 @@
           }
         }
         // 四舍五入（对负数为向远离零方向），再饱和截断
-        const v = acc >= 0 ? Math.floor(acc + 0.5) : Math.ceil(acc - 0.5);
-        out[n] = v < -32768 ? -32768 : v > 32767 ? 32767 : v;
+        out[n] = roundSaturate(acc);
       }
       // 让出事件循环，使取消信号可被观察到
       if (nLimit < L) await yieldToEventLoop();
@@ -268,6 +329,10 @@
     findBestDelay: findBestDelay,
     analyze: analyze,
     quantizeGain: quantizeGain,
+    clampDelay: clampDelay,
+    clampTrim: clampTrim,
+    roundSaturate: roundSaturate,
+    resampleLinear: resampleLinear,
     mixTracks: mixTracks,
     yieldToEventLoop: yieldToEventLoop,
     parseWav: parseWav,
