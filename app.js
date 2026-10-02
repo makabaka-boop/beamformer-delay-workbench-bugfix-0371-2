@@ -17,8 +17,8 @@
   /** 单调代际：重新导入或修改参数即换代，迟到结果一律拒绝 */
   const session = C.createSession();
 
-  let tracks = [];                 // [{name, samples, sampleRate}]
-  let autoDelays = [];             // 分析得到的延时
+  let tracks = [];                 // [{name, samples, sampleRate, length}]
+  let autoDelays = [];             // 分析得到的延时（输出采样单位）
   let sampleRate = 0;
   let delayInputs = [];
   let gainInputs = [];
@@ -35,7 +35,7 @@
     if (msg.type === 'loaded') {
       if (!session.isCurrent(msg.gen)) return; // 迟到：忽略
       statusEl.textContent = '已装载 ' + msg.count + ' 路，正在搜索对齐延时…';
-      worker.postMessage({ type: 'analyze', gen: msg.gen });
+      worker.postMessage({ type: 'analyze', gen: msg.gen, trims: readTrims() });
     }
 
     if (msg.type === 'analyzed') {
@@ -54,7 +54,7 @@
 
     if (msg.type === 'mixed') {
       if (!session.isCurrent(msg.gen)) return; // 迟到合成不能替换当前试听
-      applyMixedWav(msg.wav, msg.length);
+      applyMixedWav(msg.wav, msg.length, msg.sampleRate || sampleRate);
     }
   };
   worker.onerror = function (e) {
@@ -76,7 +76,6 @@
   async function importTracks(files) {
     hideError();
     const parsed = [];
-    let rate = 0;
     for (const file of files) {
       const buf = await file.arrayBuffer();
       let wav;
@@ -85,9 +84,15 @@
       } catch (err) {
         throw new Error('「' + file.name + '」' + err.message);
       }
-      if (rate === 0) rate = wav.sampleRate;
-      parsed.push({ name: file.name, samples: wav.samples, sampleRate: wav.sampleRate });
+      parsed.push({
+        name: file.name,
+        samples: wav.samples,
+        sampleRate: wav.sampleRate,
+        length: wav.samples.length // 转移所有权后 samples.buffer 会被 neuter，先留底
+      });
     }
+    // 基准路（第 1 路）原始采样率即输出采样率
+    const rate = parsed[0].sampleRate;
 
     // 新一批导入：换代取消旧分析/旧合成
     const gen = session.begin();
@@ -136,7 +141,7 @@
       tr.appendChild(tdName);
 
       const tdCount = document.createElement('td');
-      tdCount.textContent = String(t.samples.length);
+      tdCount.textContent = String(t.length);
       tr.appendChild(tdCount);
 
       const tdRate = document.createElement('td');
@@ -144,7 +149,7 @@
       tr.appendChild(tdRate);
 
       const tdDur = document.createElement('td');
-      tdDur.textContent = (t.samples.length / t.sampleRate).toFixed(3);
+      tdDur.textContent = (t.length / t.sampleRate).toFixed(3);
       tr.appendChild(tdDur);
 
       const tdAuto = document.createElement('td');
@@ -195,7 +200,7 @@
       trimEnd.type = 'number';
       trimEnd.min = '0';
       trimEnd.step = '1';
-      trimEnd.value = String(t.samples.length);
+      trimEnd.value = String(t.length);
       trimEnd.addEventListener('input', onParamsChanged);
       trimStartInputs[i] = trimStart;
       trimEndInputs[i] = trimEnd;
@@ -232,30 +237,54 @@
     else input.classList.remove('overridden');
   }
 
-  function readParams() {
-    const delays = tracks.map(function (t, i) {
-      if (i === 0) return 0;
-      if (delayInputs[i].value === '') return autoDelays[i];
-      const v = parseInt(delayInputs[i].value, 10);
-      return Number.isFinite(v) ? v : autoDelays[i];
+  /**
+   * 读取裁剪坐标（单位为各轨【原始】样本序号），钳制到合法区间；
+   * start>end 视为空片段。Worker 端会再钳一次，这里同步保证 UI 一致性。
+   */
+  function readTrims() {
+    return tracks.map(function (t, i) {
+      const se = C.clampTrim(
+        t.length,
+        trimStartInputs[i].value,
+        trimEndInputs[i].value
+      );
+      return { start: se[0], end: se[1] };
     });
-    const gains = tracks.map(function (t, i) {
-      // 四分之一整数倍量化（0.3 → 0.25）
-      return C.quantizeGain(parseFloat(gainInputs[i].value));
-    });
-    const trims = tracks.map(function (t, i) {
-      return { start: Number(trimStartInputs[i].value), end: Number(trimEndInputs[i].value) };
-    });
-    return { delays: delays, gains: gains, trims: trims };
   }
 
-  // ---------- 修改参数 → 取消旧任务并重新合成 ----------
+  function readParams() {
+    const delays = tracks.map(function (t, i) {
+      if (i === 0) return 0; // 基准路延时恒为 0
+      if (delayInputs[i].value === '') return autoDelays[i] || 0;
+      const v = parseInt(delayInputs[i].value, 10);
+      if (!Number.isFinite(v)) return autoDelays[i] || 0;
+      // 延时单位为【输出】整数采样，范围 [-32,+32]
+      return Math.max(-C.MAX_DELAY, Math.min(C.MAX_DELAY, v));
+    });
+    return { delays: delays, gains: readGains(), trims: readTrims() };
+  }
+
+  function readGains() {
+    return tracks.map(function (t, i) {
+      return C.quantizeGain(parseFloat(gainInputs[i].value));
+    });
+  }
+
+  // ---------- 修改参数 → 取消旧任务，重新分析（裁剪可能影响对齐）再合成 ----------
 
   function onParamsChanged() {
     if (tracks.length === 0) return;
-    statusEl.textContent = '参数已修改，等待稳定后重新合成…';
+    statusEl.textContent = '参数已修改，等待稳定后重新分析并合成…';
     clearTimeout(mixTimer);
-    mixTimer = setTimeout(runMix, 150);
+    mixTimer = setTimeout(runAnalyze, 150);
+  }
+
+  /** 用当前裁剪区间重新跑自动延时；收到 analyzed 后由回包处理器排程合成 */
+  function runAnalyze() {
+    if (tracks.length === 0) return;
+    const gen = session.begin(); // 新一代：旧分析/旧合成立即失效
+    worker.postMessage({ type: 'analyze', gen: gen, trims: readTrims() });
+    statusEl.textContent = '正在重新搜索对齐延时…';
   }
 
   function scheduleMix() {
@@ -280,7 +309,8 @@
 
   // ---------- 试听 / 下载：同一合成缓冲 ----------
 
-  function applyMixedWav(wavBuffer, length) {
+  function applyMixedWav(wavBuffer, length, outRate) {
+    const rate = outRate || sampleRate;
     const blob = new Blob([wavBuffer], { type: 'audio/wav' });
     const url = URL.createObjectURL(blob);
     releaseObjectUrl();
@@ -292,8 +322,8 @@
     const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     downloadLink.download = 'mix-' + stamp + '.wav';
 
-    mixInfo.textContent = '合成长度：' + length + ' 采样（' +
-      (length / sampleRate).toFixed(3) + ' s）';
+    mixInfo.textContent = '输出采样率 ' + rate + ' Hz；合成长度：' + length +
+      ' 采样（' + (length / rate).toFixed(3) + ' s）';
     outputSection.hidden = false;
     statusEl.textContent = '合成完成，可试听或下载。';
   }

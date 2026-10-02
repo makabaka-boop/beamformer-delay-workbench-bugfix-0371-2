@@ -88,6 +88,99 @@
     return q;
   }
 
+  /** 四舍五入（负数向远离零方向） */
+  function roundHalfAway(v) {
+    return v >= 0 ? Math.floor(v + 0.5) : Math.ceil(v - 0.5);
+  }
+
+  /** 饱和截断到 PCM16 [-32768,32767] */
+  function clampInt16(v) {
+    return v < -32768 ? -32768 : v > 32767 ? 32767 : v;
+  }
+
+  /**
+   * 把裁剪坐标钳制到 [0, len] 的整数区间。
+   * NaN/非有限：start→0、end→len；start>end 视为空片段 [s,s)。
+   * 坐标始终相对于该轨【原始】采样序号输入。
+   */
+  function clampTrim(len, start, end) {
+    let s = Number(start);
+    let e = Number(end);
+    if (!Number.isFinite(s)) s = 0;
+    if (!Number.isFinite(e)) e = len;
+    s = Math.trunc(s);
+    e = Math.trunc(e);
+    s = Math.max(0, Math.min(len, s));
+    e = Math.max(0, Math.min(len, e));
+    if (e < s) e = s; // 空片段
+    return [s, e];
+  }
+
+  /**
+   * 线性插值重采样：srcRate → dstRate。
+   *
+   * 输出采样数 outLen = round(n · dstRate/srcRate)；输出样本 m 对应源位置
+   * x = m · srcRate/dstRate，在相邻源样本间线性插值（端点钳到末样本），
+   * 四舍五入后落回 PCM16。同采样率时零拷贝直接返回原数组。
+   *
+   * maxOut 给定时只产出前 maxOut 个输出采样（分析窗口用），位置与全量
+   * 重采样完全一致。signal 可选：每块让出事件循环并检查取消，取消返回 null。
+   */
+  async function resampleSamples(samples, srcRate, dstRate, signal, maxOut) {
+    if (!(srcRate > 0) || !(dstRate > 0)) {
+      throw new Error('采样率必须为正数');
+    }
+    const n = samples.length;
+    if (n === 0) return samples;
+    if (srcRate === dstRate) {
+      return maxOut != null && maxOut >= 0 && maxOut < n
+        ? samples.subarray(0, maxOut)
+        : samples;
+    }
+    let outLen = Math.round(n * dstRate / srcRate);
+    if (!(outLen >= 0)) outLen = 0;
+    if (maxOut != null && maxOut >= 0 && outLen > maxOut) outLen = maxOut;
+    const out = new Int16Array(outLen);
+    if (outLen === 0) return out;
+
+    const ratio = srcRate / dstRate;
+    const CHUNK = 2048;
+    for (let m0 = 0; m0 < outLen; m0 += CHUNK) {
+      if (signal && signal.cancelled) return null;
+      const mLimit = Math.min(outLen, m0 + CHUNK);
+      for (let m = m0; m < mLimit; m++) {
+        const x = m * ratio;
+        const i = x < n - 1 ? Math.floor(x) : n - 1;
+        const f = x - i;
+        const v = (f === 0 || i >= n - 1)
+          ? samples[i]
+          : samples[i] + (samples[i + 1] - samples[i]) * f;
+        out[m] = clampInt16(roundHalfAway(v));
+      }
+      if (mLimit < outLen) await yieldToEventLoop();
+    }
+    if (signal && signal.cancelled) return null;
+    return out;
+  }
+
+  /**
+   * 单轨预处理（分析与合成共用，保证自动延时与可听内容来自同一份数据）：
+   * 先按原始采样坐标裁剪（空片段允许），再线性重采样到输出采样率。
+   * maxOut 非空时只保留前 maxOut 个输出采样（分析窗口）。
+   * 取消时返回 null。
+   */
+  async function prepareClip(samples, srcRate, dstRate, trim, signal, maxOut) {
+    let s = 0;
+    let e = samples.length;
+    if (trim) {
+      const clamped = clampTrim(samples.length, trim.start, trim.end);
+      s = clamped[0];
+      e = clamped[1];
+    }
+    const clip = samples.subarray(s, e);
+    return resampleSamples(clip, srcRate || dstRate, dstRate, signal, maxOut);
+  }
+
   /**
    * 逐样本混音。
    *
@@ -125,8 +218,7 @@
           }
         }
         // 四舍五入（对负数为向远离零方向），再饱和截断
-        const v = acc >= 0 ? Math.floor(acc + 0.5) : Math.ceil(acc - 0.5);
-        out[n] = v < -32768 ? -32768 : v > 32767 ? 32767 : v;
+        out[n] = clampInt16(roundHalfAway(acc));
       }
       // 让出事件循环，使取消信号可被观察到
       if (nLimit < L) await yieldToEventLoop();
@@ -268,6 +360,11 @@
     findBestDelay: findBestDelay,
     analyze: analyze,
     quantizeGain: quantizeGain,
+    roundHalfAway: roundHalfAway,
+    clampInt16: clampInt16,
+    clampTrim: clampTrim,
+    resampleSamples: resampleSamples,
+    prepareClip: prepareClip,
     mixTracks: mixTracks,
     yieldToEventLoop: yieldToEventLoop,
     parseWav: parseWav,

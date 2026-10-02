@@ -314,3 +314,184 @@ test('Worker 正常链路：loaded → analyzed(gen内联触发) → mixed 内�
   const parsed = C.parseWav(mixed.wav);
   assert.deepEqual(Array.from(parsed.samples), [110, 220, 330]);
 });
+
+// ---------- 混合采样率：重采样、对齐、WAV 标称时长 ----------
+
+test('resampleSamples：同采样率零拷贝；2x 上采样长度翻倍且保物理时刻', async () => {
+  const s = i16([10, 20, 30, 40]);
+  assert.strictEqual(await C.resampleSamples(s, 8000, 8000), s);
+
+  const up = await C.resampleSamples(s, 8000, 16000);
+  assert.equal(up.length, 8);
+  // 物理时刻一致：输出偶数位取原样本，奇数位线性插值
+  assert.deepEqual(Array.from(up), [10, 15, 20, 25, 30, 35, 40, 40]);
+
+  const down = await C.resampleSamples(i16([10, 20, 30, 40]), 16000, 8000);
+  assert.equal(down.length, 2);
+  assert.deepEqual(Array.from(down), [10, 30]);
+
+  // 空数组重采样仍为空
+  assert.deepEqual(Array.from(await C.resampleSamples(i16([]), 8000, 16000)), []);
+  await assert.rejects(() => C.resampleSamples(s, 0, 8000), /采样率/);
+});
+
+test('resampleSamples：maxOut 位置与全量重采样前缀一致（分析窗口）', async () => {
+  let seed = 99;
+  const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return (seed % 4001) - 2000; };
+  const s = i16(Array.from({ length: 10000 }, rand));
+  const full = await C.resampleSamples(s, 22050, 48000);
+  const prefix = await C.resampleSamples(s, 22050, 48000, null, 4096);
+  assert.equal(prefix.length, 4096);
+  for (let m = 0; m < 4096; m++) {
+    assert.equal(prefix[m], full[m], `m=${m}`);
+  }
+});
+
+test('混合采样率：同一物理时刻脉冲（48k@0.1s 与 24k@0.1s）自动延时为 0', async () => {
+  const ref = new Int16Array(48000); ref[4800] = 10000;
+  const lo = new Int16Array(24000); lo[2400] = 10000;
+  const loUp = await C.resampleSamples(lo, 24000, 48000);
+
+  // 分析只取前 4096 输出采样（脉冲位于 4800，落在窗口外）→ 改测窗口内脉冲版本
+  const refW = new Int16Array(4096); refW[1000] = 10000;
+  // 对应 24k：同一物理时刻下标 round(1000*24000/48000)=500
+  const loW = new Int16Array(2048); loW[500] = 10000;
+  const loUpW = await C.resampleSamples(loW, 24000, 48000, null, 4096);
+  assert.equal(C.findBestDelay(refW, loUpW), 0);
+  // 全量同样对齐
+  assert.equal(C.findBestDelay(ref.subarray(0, C.WINDOW), loUp.subarray(0, C.WINDOW)), 0);
+});
+
+test('prepareClip：裁剪坐标按原始样本序号、再重采样；start>end 为空片段', async () => {
+  const s = i16([10, 20, 30, 40]);
+  // 裁 [2,4) → [30,40]，再 2x → [30,35,40,40]
+  const clip = await C.prepareClip(s, 8000, 16000, { start: 2, end: 4 });
+  assert.deepEqual(Array.from(clip), [30, 35, 40, 40]);
+
+  // NaN / 越界 / 负数由 clampTrim 钳制
+  assert.deepEqual(C.clampTrim(100, NaN, NaN), [0, 100]);
+  assert.deepEqual(C.clampTrim(100, -5, 200), [0, 100]);
+  assert.deepEqual(C.clampTrim(100, 80, 10), [80, 80]);
+
+  const empty = await C.prepareClip(s, 8000, 16000, { start: 3, end: 1 });
+  assert.equal(empty.length, 0);
+});
+
+test('混合采样率混音：全长对齐，WAV 标称时长 == 可听内容时长', async () => {
+  const ref = new Int16Array(8000); ref.fill(10);      // 1s @8k
+  const lo = new Int16Array(4000); lo.fill(20);       // 1s @4k
+  const loUp = await C.resampleSamples(lo, 4000, 8000);
+  assert.equal(loUp.length, 8000);
+  const out = await C.mixTracks([ref, loUp], [0, 0], [1, 1]);
+  assert.equal(out.length, 8000); // 旧实现只有 4000：低采样率轨提前结束
+  const wav = C.parseWav(C.encodeWav(out, 8000));
+  assert.equal(wav.sampleRate, 8000);
+  assert.equal(wav.samples.length, 8000);
+  assert.equal(wav.samples.length / wav.sampleRate, 1);
+  assert.equal(wav.samples[7999], 30); // 尾部仍有两路叠加，而非静音
+});
+
+// ---------- Worker：混合采样率 + 裁剪 + 代际一致性 ----------
+
+test('Worker 混合采样率链路：analyze 与 mix 同一预处理，自动延时 0、输出按基准率', async () => {
+  const ep = createEndpointPair();
+  const ref = new Int16Array(4096);
+  const lo = new Int16Array(2048);
+  ref[1000] = 10000;
+  lo[500] = 10000; // 同一物理时刻
+  ep.post({
+    type: 'load', gen: 1,
+    tracks: [
+      { name: 'ref', samples: ref, sampleRate: 48000 },
+      { name: 'lo', samples: lo, sampleRate: 24000 }
+    ],
+    sampleRate: 48000
+  });
+  ep.post({
+    type: 'analyze', gen: 1,
+    trims: [{ start: 0, end: 4096 }, { start: 0, end: 2048 }]
+  });
+
+  await ep.drain();
+
+  const analyzed = ep.replies.find((r) => r.type === 'analyzed');
+  assert.ok(analyzed);
+  assert.deepEqual(analyzed.delays, [0, 0]);
+
+  const ep2 = createEndpointPair();
+  ep2.post({
+    type: 'load', gen: 1,
+    tracks: [
+      { name: 'ref', samples: ref, sampleRate: 48000 },
+      { name: 'lo', samples: lo, sampleRate: 24000 }
+    ],
+    sampleRate: 48000
+  });
+  ep2.post({
+    type: 'mix', gen: 1, delays: [0, 0], gains: [1, 1],
+    trims: [{ start: 0, end: 4096 }, { start: 0, end: 2048 }],
+    sampleRate: 48000
+  });
+  await ep2.drain();
+  const mixed = ep2.replies.find((r) => r.type === 'mixed');
+  assert.ok(mixed);
+  assert.equal(mixed.sampleRate, 48000);
+  assert.equal(mixed.length, 4096); // 重采样后两轨等长，不再提前结束
+});
+
+test('Worker 迟到 analyze 回复携带【请求】代际，不会被贴上新号', async () => {
+  const ep = createEndpointPair();
+  const ref = new Int16Array(4096);
+  const lo = new Int16Array(2048);
+  ref[1000] = 10000; lo[500] = 10000;
+  ep.post({
+    type: 'load', gen: 1,
+    tracks: [
+      { name: 'ref', samples: ref, sampleRate: 48000 },
+      { name: 'lo', samples: lo, sampleRate: 24000 }
+    ],
+    sampleRate: 48000
+  });
+  // gen1 的分析（带裁剪）
+  ep.post({ type: 'analyze', gen: 1, trims: [{ start: 0, end: 4096 }, { start: 0, end: 2048 }] });
+  // gen2 立即换代（重新导入）
+  ep.post({
+    type: 'load', gen: 2,
+    tracks: [
+      { name: 'ref2', samples: ref, sampleRate: 48000 },
+      { name: 'lo2', samples: lo, sampleRate: 24000 }
+    ],
+    sampleRate: 48000
+  });
+  await ep.drain();
+
+  const analyzed = ep.replies.filter((r) => r.type === 'analyzed');
+  // 旧分析若回传，gen 必须是请求自身的 1（主线程据 isCurrent 丢弃）；
+  // 取消及时则根本不回传。两种情况都不允许出现 gen:2 的 analyzed。
+  assert.ok(!analyzed.some((r) => r.gen === 2), '旧 analyze 不得携带新代际号');
+  assert.ok(analyzed.every((r) => r.gen === 1));
+});
+
+test('空片段（裁剪为零长度）参与混音不报错，仅另一轨出声', async () => {
+  const a = i16([1, 2, 3]);
+  const b = i16([9, 9, 9]);
+  // b 被裁成空片段
+  const out = await C.mixTracks(
+    [a, await C.prepareClip(b, 8000, 8000, { start: 2, end: 2 })],
+    [0, 0], [1, 1]
+  );
+  assert.deepEqual(Array.from(out), [1, 2, 3]);
+});
+
+test('负延时在重采样后的输出采样坐标上仍然成立', async () => {
+  const base = i16(new Array(300).fill(0).map((_, i) => ((i * 37) % 53) - 26));
+  // 低采样率轨：先右移 2 个输出采样的等价物理量，再以一半采样率呈现
+  const shifted = new Int16Array(302);
+  for (let n = 0; n < base.length; n++) shifted[n + 2] = base[n];
+  // 降一半采样率：取偶数点（长度 151），再升回 8k
+  const half = new Int16Array(Math.ceil(shifted.length / 2));
+  for (let i = 0; i < half.length; i++) half[i] = shifted[i * 2];
+  const back = await C.resampleSamples(half, 4000, 8000);
+  // 右移 2 采样 → 对齐延时 d=-2（搜索范围内应能恢复）
+  assert.equal(C.findBestDelay(base, back), -2);
+});
